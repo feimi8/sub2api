@@ -1196,6 +1196,14 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 			if msg == "" {
 				msg = "Upstream compact response failed"
 			}
+			// context-window 超限是确定性的客户端错误（换任何账号都必然同样失败），
+			// 不能包成 502/upstream_error 触发误换号；应返回 400 +
+			// invalid_request_error/context_length_exceeded，与上游其它路径
+			// （shouldFailoverOpenAIPassthroughResponse、sanitizeOpenAIResponseFailedEventForClient）
+			// 对 context-window 的处理保持一致。此 SSE→JSON 非流式聚合分支是上游遗漏点。
+			if isOpenAIContextWindowError(msg, terminalPayload) {
+				return nil, s.writeOpenAIContextWindowError(resp, c, msg)
+			}
 			return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 		}
 		usage = s.parseSSEUsageFromBody(bodyText)
@@ -1332,6 +1340,34 @@ func (s *OpenAIGatewayService) writeOpenAINonStreamingProtocolError(resp *http.R
 		},
 	})
 	return fmt.Errorf("non-streaming openai protocol error: %s", message)
+}
+
+// writeOpenAIContextWindowError 处理 SSE→JSON 非流式聚合路径下的 context-window
+// 超限错误。与 writeOpenAINonStreamingProtocolError 不同，它返回 400 +
+// invalid_request_error/context_length_exceeded，而不是硬编码的 502/upstream_error，
+// 避免把确定性的客户端输入错误误报为上游故障（并防止上层据此徒劳换号）。
+func (s *OpenAIGatewayService) writeOpenAIContextWindowError(resp *http.Response, c *gin.Context, message string) error {
+	message = sanitizeUpstreamErrorMessage(strings.TrimSpace(message))
+	if message == "" {
+		message = "Your input exceeds the context window of this model. Please adjust your input and try again."
+	}
+	setOpsUpstreamError(c, http.StatusBadRequest, message, "")
+	// body-signal compact 心跳可能已把响应头提交为 200，此时只能以
+	// response.failed 终止事件回传错误，不能再写 JSON+状态码。
+	if openAICompactClientWantsStream(c) && StopOpenAICompactSSEKeepaliveCommitted(c) {
+		writeOpenAICompactSSEFailureMessage(c, http.StatusBadRequest, "invalid_request_error", message)
+		return fmt.Errorf("context window exceeded: %s", message)
+	}
+	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+	c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error": gin.H{
+			"type":    "invalid_request_error",
+			"code":    "context_length_exceeded",
+			"message": message,
+		},
+	})
+	return fmt.Errorf("context window exceeded: %s", message)
 }
 
 func extractCodexFinalResponse(body string) ([]byte, bool) {

@@ -2910,6 +2910,62 @@ func TestHandleSSEToJSON_CompletedEventReturnsJSON(t *testing.T) {
 	require.NotContains(t, rec.Body.String(), "data:")
 }
 
+// context-window 超限的 response.failed 事件必须映射为 400 +
+// invalid_request_error/context_length_exceeded，而不是硬编码的 502/upstream_error。
+// 回归 #(custom)：SSE→JSON 非流式聚合路径此前漏判 context-window，导致确定性
+// 客户端输入错误被误报为上游故障（并触发上层徒劳换号 → 502）。
+func TestHandleSSEToJSON_ContextWindowFailedEventReturns400(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+
+	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+	resp := &http.Response{
+		StatusCode: http.StatusBadGateway, // 上游/上层此前给的是 502，补丁应改写为 400
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	body := []byte(strings.Join([]string{
+		`data: {"type":"response.in_progress","response":{"id":"resp_ctx"}}`,
+		`data: {"type":"response.failed","response":{"id":"resp_ctx","error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again.","type":"upstream_error"}}}`,
+	}, "\n"))
+
+	usage, err := svc.handleSSEToJSON(resp, c, body, "gpt-5.6-sol", "gpt-5.6-sol")
+	require.Error(t, err)
+	require.Nil(t, usage)
+	require.Equal(t, http.StatusBadRequest, rec.Code, "context-window 超限应返回 400，而不是 502")
+	require.Contains(t, rec.Body.String(), `"invalid_request_error"`)
+	require.Contains(t, rec.Body.String(), `"context_length_exceeded"`)
+	require.Contains(t, rec.Body.String(), "exceeds the context window")
+	require.NotContains(t, rec.Body.String(), "upstream_error", "不应再包成 upstream_error")
+}
+
+// 非 context-window 的 response.failed 仍应走原有 502/upstream_error 路径，确保补丁
+// 不会误伤其它上游失败的语义。
+func TestHandleSSEToJSON_GenericFailedEventStays502(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+
+	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+	resp := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	body := []byte(strings.Join([]string{
+		`data: {"type":"response.in_progress","response":{"id":"resp_generic"}}`,
+		`data: {"type":"response.failed","response":{"id":"resp_generic","error":{"message":"The server had an error while processing your request.","type":"server_error"}}}`,
+	}, "\n"))
+
+	usage, err := svc.handleSSEToJSON(resp, c, body, "gpt-5.6-sol", "gpt-5.6-sol")
+	require.Error(t, err)
+	require.Nil(t, usage)
+	require.Equal(t, http.StatusBadGateway, rec.Code, "普通上游失败仍应保持 502")
+	require.Contains(t, rec.Body.String(), "upstream_error")
+	require.NotContains(t, rec.Body.String(), "context_length_exceeded")
+}
+
 func TestHandleNonStreamingResponse_APIKeyFallsBackToSSEBodyWhenContentTypeIsWrong(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
