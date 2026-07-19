@@ -365,7 +365,11 @@ func TestForwardAsChatCompletions_BufferedContextWindowResponseFailedReturnsErro
 	var failoverErr *UpstreamFailoverError
 	require.False(t, errors.As(err, &failoverErr))
 	require.True(t, c.Writer.Written())
-	require.Equal(t, http.StatusBadGateway, rec.Code)
+	// context-window 超限返回 400 + invalid_request_error/context_length_exceeded，
+	// 而非 502/upstream_error，与 /v1/responses 路径一致，避免上层徒劳换号。
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "context_length_exceeded")
+	require.Contains(t, rec.Body.String(), "invalid_request_error")
 	require.Contains(t, rec.Body.String(), "input exceeds the context window")
 }
 
@@ -410,8 +414,11 @@ func TestForwardAsChatCompletions_StreamContextWindowResponseFailedReturnsErrorW
 	var failoverErr *UpstreamFailoverError
 	require.False(t, errors.As(err, &failoverErr))
 	require.True(t, c.Writer.Written())
-	require.Equal(t, http.StatusBadGateway, rec.Code)
+	// 上游 response.failed 在 client 输出开始前到达：context-window 超限以 400 +
+	// invalid_request_error/context_length_exceeded 回写 JSON，而非 502/upstream_error。
+	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
+	require.Contains(t, rec.Body.String(), "context_length_exceeded")
 	require.Contains(t, rec.Body.String(), "input exceeds the context window")
 	require.NotContains(t, rec.Body.String(), "[DONE]")
 }

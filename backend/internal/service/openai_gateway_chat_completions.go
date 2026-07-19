@@ -442,6 +442,13 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 			return nil, s.newOpenAIStreamFailoverError(c, account, false, requestID, payload, message)
 		}
 		message = s.recordOpenAIStreamUpstreamError(c, account, false, requestID, "http_error", payload, message)
+		// context-window 超限是确定性的客户端错误（换任何账号都必然同样失败），
+		// 不能包成 502/upstream_error 触发误换号；返回 400 +
+		// invalid_request_error/context_length_exceeded，与 /v1/responses 路径一致。
+		if isOpenAIContextWindowError(message, payload) {
+			writeChatCompletionsContextWindowError(c, message)
+			return nil, fmt.Errorf("context window exceeded: %s", message)
+		}
 		// response.failed 到达在 HTTP 200 SSE 流上，无真实 HTTP 错误码；统一走语义
 		// 状态推断 + body 归一化（与 /v1/responses 路径一致），使按错误码配置的规则可命中。
 		if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(
@@ -611,25 +618,40 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			}
 			message = s.recordOpenAIStreamUpstreamError(c, account, false, requestID, "http_error", payloadBytes, message)
 			defaultStatus, defaultErrType, defaultMsg := http.StatusBadGateway, "upstream_error", message
-			// 统一走语义状态推断 + body 归一化（与 /v1/responses 路径一致），
-			// 使按错误码配置的透传规则可命中。
-			if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(
-				c, account.Platform, payloadBytes, message,
-			); matched {
-				if errMsg == "" {
-					errMsg = defaultMsg
-				}
-				defaultStatus, defaultErrType, defaultMsg = status, errType, errMsg
-				MarkResponseCommitted(c)
+			// context-window 超限是确定性的客户端错误，返回 400 +
+			// invalid_request_error/context_length_exceeded（与 /v1/responses 路径一致），
+			// 避免误报上游故障触发上层徒劳换号。此判定优先于通用透传规则。
+			contextWindowExceeded := isOpenAIContextWindowError(message, payloadBytes)
+			if contextWindowExceeded {
+				defaultStatus, defaultErrType, defaultMsg = http.StatusBadRequest, "invalid_request_error", message
 			}
-			errorPayload, _ := json.Marshal(gin.H{
-				"error": gin.H{
-					"type":    defaultErrType,
-					"message": defaultMsg,
-				},
-			})
+			// 统一走语义状态推断 + body 归一化（与 /v1/responses 路径一致），
+			// 使按错误码配置的透传规则可命中。context-window 已确定语义，跳过透传规则覆盖。
+			if !contextWindowExceeded {
+				if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(
+					c, account.Platform, payloadBytes, message,
+				); matched {
+					if errMsg == "" {
+						errMsg = defaultMsg
+					}
+					defaultStatus, defaultErrType, defaultMsg = status, errType, errMsg
+					MarkResponseCommitted(c)
+				}
+			}
+			errorObj := gin.H{
+				"type":    defaultErrType,
+				"message": defaultMsg,
+			}
+			if contextWindowExceeded {
+				errorObj["code"] = "context_length_exceeded"
+			}
+			errorPayload, _ := json.Marshal(gin.H{"error": errorObj})
 			if c != nil && c.Writer != nil && !c.Writer.Written() {
-				writeChatCompletionsError(c, defaultStatus, defaultErrType, defaultMsg)
+				if contextWindowExceeded {
+					writeChatCompletionsContextWindowError(c, defaultMsg)
+				} else {
+					writeChatCompletionsError(c, defaultStatus, defaultErrType, defaultMsg)
+				}
 				clientOutputStarted = true
 			} else if c != nil && c.Writer != nil && !clientDisconnected {
 				if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", errorPayload); err != nil {
@@ -958,6 +980,27 @@ func writeChatCompletionsError(c *gin.Context, statusCode int, errType, message 
 	c.JSON(statusCode, gin.H{
 		"error": gin.H{
 			"type":    errType,
+			"message": message,
+		},
+	})
+}
+
+// writeChatCompletionsContextWindowError 处理 Chat Completions 路径下的
+// context-window 超限错误。与硬编码 502/upstream_error 不同，它返回 400 +
+// invalid_request_error/context_length_exceeded，与 /v1/responses 路径
+// （writeOpenAIContextWindowError）保持一致，避免把确定性的客户端输入错误
+// 误报为上游故障，并防止上层（如 new-api）据此徒劳换号/重试。
+func writeChatCompletionsContextWindowError(c *gin.Context, message string) {
+	message = sanitizeUpstreamErrorMessage(strings.TrimSpace(message))
+	if message == "" {
+		message = "Your input exceeds the context window of this model. Please adjust your input and try again."
+	}
+	setOpsUpstreamError(c, http.StatusBadRequest, message, "")
+	MarkResponseCommitted(c)
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error": gin.H{
+			"type":    "invalid_request_error",
+			"code":    "context_length_exceeded",
 			"message": message,
 		},
 	})
