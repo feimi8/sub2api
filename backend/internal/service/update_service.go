@@ -30,7 +30,9 @@ var (
 const (
 	updateCacheKey = "update_check_cache"
 	updateCacheTTL = 1200 // 20 minutes
-	githubRepo     = "Wei-Shaw/sub2api"
+	// custom: 升级源指向本 fork，使一键升级拉取带 custom 补丁的 release，
+	// 而非上游 Wei-Shaw/sub2api（上游 release 不含本分支补丁）。
+	githubRepo     = "feimi8/sub2api"
 
 	// Security: allowed download domains for updates
 	allowedDownloadHost = "github.com"
